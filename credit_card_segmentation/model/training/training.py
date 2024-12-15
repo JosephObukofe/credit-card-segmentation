@@ -1,11 +1,14 @@
 import numpy as np
 import pandas as pd
 import joblib
+import mlflow
+import logging
+from skopt.space import Categorical, Integer
 from joblib import Parallel, delayed
 from credit_card_segmentation.data.custom import (
-    train_kmeans_clusterer,
-    train_dbscan_clusterer,
-    train_hierarchical_clusterer,
+    train_kmeans_clusterer_with_grid_search,
+    train_dbscan_clusterer_with_grid_search,
+    train_hierarchical_clusterer_with_grid_search,
 )
 from credit_card_segmentation.config.config import (
     MODEL_TRAINING_DATA,
@@ -15,11 +18,18 @@ from credit_card_segmentation.config.config import (
     TRAINED_KMEANS_FEATURES,
     TRAINED_DBSCAN_FEATURES,
     TRAINED_HIERARCHICAL_FEATURES,
+    MLFLOW_TRACKING_URI
 )
 
-X_train = joblib.load(MODEL_TRAINING_DATA)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+mlflow.set_experiment("Credit Card Segmentation: Model Training")
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+
+X_train = joblib.load(MODEL_TRAINING_DATA)
 features = [feature for feature in X_train.columns]
+trained_models = [TRAINED_KMEANS_CLUSTERER, TRAINED_DBSCAN_CLUSTERER, TRAINED_HIERARCHICAL_CLUSTERER]
+optimal_features = [TRAINED_KMEANS_FEATURES, TRAINED_DBSCAN_FEATURES, TRAINED_HIERARCHICAL_FEATURES]
 
 kmeans_model_param_grid = {
     "n_clusters": [2, 3, 4, 5, 6],
@@ -41,37 +51,50 @@ hierarchical_model_param_grid = {
 }
 
 
+def safe_task(func, *args, **kwargs):
+    try:
+        return func(*args, **kwargs)
+    except Exception as e:
+        logging.error(f"Error in {func.__name__}: {e}")
+        return None
+    
+
 def parallel_model_training():
     tasks = [
-        delayed(train_kmeans_clusterer)(X_train, kmeans_model_param_grid, features),
-        delayed(train_dbscan_clusterer)(X_train, dbscan_model_param_grid, features),
-        delayed(train_hierarchical_clusterer)(
-            X_train, hierarchical_model_param_grid, features
+        delayed(safe_task)(
+            train_kmeans_clusterer_with_grid_search, 
+            X_train, 
+            kmeans_model_param_grid, 
+            features
+        ),
+        delayed(safe_task)(
+            train_dbscan_clusterer_with_grid_search, 
+            X_train, 
+            dbscan_model_param_grid, 
+            features
+        ),
+        delayed(safe_task)(
+            train_hierarchical_clusterer_with_grid_search,
+            X_train, 
+            hierarchical_model_param_grid, 
+            features
         ),
     ]
 
-    trained_models = Parallel(n_jobs=-1, verbose=10)(tasks)
-
-    for i, model_output in enumerate(trained_models):
-        print(f"Model {i + 1} Training Output:")
-        print(f"Model: {model_output['Model']}")
-        print(f"Optimal Features: {model_output['Optimal Features']}")
-        print(f"Silhouette Score: {model_output['Silhouette Score']}")
-        print("\n")
-
-    return trained_models
+    trained_models_output = Parallel(n_jobs=4, verbose=10)(tasks)
+    for i, model_output in enumerate(trained_models_output):
+        if model_output:
+            logging.info(f"Model {i + 1} Training Successful")
+            logging.info(f"Silhouette Score: {model_output['Silhouette Score']}")
+        else:
+            logging.warning(f"Model {i + 1} Training Failed")
+    return trained_models_output
 
 
-# Training each model in parallel
 if __name__ == "__main__":
     trained_models_output = parallel_model_training()
 
-# Save each trained model to its respective path
-joblib.dump(trained_models_output[0]["Model"], TRAINED_KMEANS_CLUSTERER)
-joblib.dump(trained_models_output[1]["Model"], TRAINED_DBSCAN_CLUSTERER)
-joblib.dump(trained_models_output[2]["Model"], TRAINED_HIERARCHICAL_CLUSTERER)
-
-# Save the optimal features of each model
-joblib.dump(trained_models_output[0]["Optimal Features"], TRAINED_KMEANS_FEATURES)
-joblib.dump(trained_models_output[1]["Optimal Features"], TRAINED_DBSCAN_FEATURES)
-joblib.dump(trained_models_output[2]["Optimal Features"], TRAINED_HIERARCHICAL_FEATURES)
+    for i, model_output in enumerate(trained_models_output):
+        if model_output:
+            joblib.dump(model_output["Model"], trained_models[i])
+            joblib.dump(model_output["Optimal Features"], optimal_features[i])
