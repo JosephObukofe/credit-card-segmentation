@@ -1,7 +1,26 @@
+import os
+import io
+import boto3
+import pickle
+import logging
+import tempfile
+import mlflow.tracking
 import numpy as np
 import pandas as pd
+import urllib.parse
+import mlflow
+import mlflow.sklearn
+import mlflow.tracking
+import mlflow.pyfunc
+from mlflow.exceptions import MlflowException
+from botocore.exceptions import BotoCoreError, ClientError
+from minio import Minio
+from minio.error import MinioException, S3Error
+from datetime import datetime
 from typing import List, Dict, Any, Tuple, Union, Optional
 from matplotlib import pyplot as plt
+from skopt import BayesSearchCV
+from itertools import combinations
 from sklearn.base import BaseEstimator, TransformerMixin, ClusterMixin, clone
 from sklearn.preprocessing import PowerTransformer, StandardScaler
 from sklearn.compose import ColumnTransformer
@@ -13,6 +32,12 @@ from sklearn.metrics import (
     calinski_harabasz_score,
     silhouette_score,
     davies_bouldin_score,
+)
+from credit_card_segmentation.config.config import (
+    MLFLOW_TRACKING_URI,
+    MINIO_CONSOLE_ADDRESS,
+    MINIO_ROOT_USER,
+    MINIO_ROOT_PASSWORD,
 )
 
 
@@ -160,6 +185,21 @@ class NoCV(BaseCrossValidator):
         yield indices, indices
 
 
+class DBSCANWithPredict(BaseEstimator):
+    def __init__(self, **kwargs):
+        self.model = DBSCAN(**kwargs)
+
+    def fit(self, X, y=None):
+        self.model.fit(X)
+        return self
+
+    def predict(self, X):
+        return self.model.fit_predict(X)
+
+    def fit_predict(self, X, y=None):
+        return self.model.fit_predict(X)
+
+
 def preprocess_training_set(
     X: pd.DataFrame,
     missing_value_features: List[str],
@@ -253,10 +293,12 @@ def preprocess_training_set(
         + sparse_features
         + skewed_features
     )
+
     final_df = pd.concat(
         [X_dropped.reset_index(drop=True), processed_df.reset_index(drop=True)],
         axis=1,
     )
+
     return final_df, pipeline
 
 
@@ -318,10 +360,12 @@ def preprocess_test_set(
         + sparse_features
         + skewed_features
     )
+
     final_df = pd.concat(
         [X_dropped.reset_index(drop=True), processed_df.reset_index(drop=True)],
         axis=1,
     )
+
     return final_df
 
 
@@ -344,14 +388,116 @@ def load_data(file_path: str) -> pd.DataFrame:
     return raw_data
 
 
+def read_csv_from_minio(
+    bucket_name: str,
+    object_name: str,
+) -> pd.DataFrame:
+    """
+    Read a CSV file from MinIO and load it into a pandas DataFrame.
+
+    Parameters
+    ----------
+    bucket_name : str
+        The name of the MinIO bucket where the CSV file is stored.
+    object_name : str
+        The name of the CSV file (object) in the MinIO bucket.
+
+    Returns
+    -------
+    pd.DataFrame
+        A pandas DataFrame containing the data from the CSV file.
+
+    Raises
+    -------
+    S3Error
+        If the specified object does not exist in the MinIO bucket or other S3-related error.
+    Exception
+        For any other errors that may occur while reading the CSV file.
+    """
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    s3_client = boto3.client(
+        "s3",
+        endpoint_url=MINIO_CONSOLE_ADDRESS,
+        aws_access_key_id=MINIO_ROOT_USER,
+        aws_secret_access_key=MINIO_ROOT_PASSWORD,
+    )
+
+    try:
+        response = s3_client.get_object(Bucket=bucket_name, Key=object_name)
+        df = pd.read_csv(response['Body'])
+        logger.info(f"Successfully loaded CSV data from '{object_name}' in bucket '{bucket_name}'")
+        return df
+    except S3Error as e:
+        logger.error(f"S3 error: The object '{object_name}' does not exist in bucket '{bucket_name}' or another S3-related error occurred: {e}")
+        return None
+    except Minio.S3Error as e:
+        logger.error(f"MinIO error connecting to bucket: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error reading CSV file: {e}")
+        return None
+
+
+def upload_data_to_minio(
+    dataframe: pd.DataFrame,
+    bucket_name: str,
+    object_name: str,
+) -> None:
+    """
+    Uploads a pandas DataFrame to MinIO as a pickled object.
+    
+    Parameters
+    ----------
+    dataframe : pd.DataFrame
+        The pandas DataFrame to be uploaded to MinIO.
+    bucket_name : str
+        The name of the MinIO bucket where the pickled dataframe will be stored.
+    object_name : str
+        The name of the pickled dataframe (object) in the MinIO bucket.
+        
+    Returns
+    -------
+    None
+    """
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    s3_client = boto3.client(
+        "s3",
+        endpoint_url=MINIO_CONSOLE_ADDRESS,
+        aws_access_key_id=MINIO_ROOT_USER,
+        aws_secret_access_key=MINIO_ROOT_PASSWORD,
+    )
+
+    try:
+        with io.BytesIO() as buffer:
+            pickle.dump(dataframe, buffer)
+            buffer.seek(0)
+            s3_client.upload_fileobj(buffer, bucket_name, object_name)
+            print(f"Uploaded dataframe to MinIO bucket {bucket_name} as {object_name}")
+    except ClientError as e:
+        logger.error(f"Error uploading dataframe to MinIO: {e}")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred: {e}")
+
+
+def load_data_from_minio():
+    pass
+
+
 def recursive_cluster_feature_elimination(
     estimator: ClusterMixin,
     X_train: pd.DataFrame,
     features: List[str],
+    group_size: int = 2,
+    patience: int = 4,
 ) -> Tuple[ClusterMixin, List[str], float]:
     """
-    Perform Recursive Cluster Feature Elimination (RCFE) to find the optimal set of features
-    based on the silhouette score by iteratively removing features.
+    Perform Recursive Cluster Feature Elimination (RCFE) with group evaluation to find the optimal set of features based on the silhouette score by iteratively removing groups of features, excluding noise points.
 
     Parameters:
     ----------
@@ -361,6 +507,10 @@ def recursive_cluster_feature_elimination(
         The training dataset with all features.
     features : List[str]
         The initial list of feature names to consider.
+    group_size : int, optional (default=2)
+        The number of features to remove as a group during each iteration.
+    patience : int, optional (default=3)
+        Number of iterations to wait for improvement before stopping early.
 
     Returns:
     -------
@@ -375,16 +525,24 @@ def recursive_cluster_feature_elimination(
     n_features = X_train.shape[1]
     current_features = features.copy()
     best_silhouette_score = -1
-    optimal_features = current_features
-    X_train_optimal = X_train
+    optimal_features = current_features.copy()
     optimal_model = None
+    no_improvement_count = 0
 
-    for i in range(n_features):
+    print(
+        f"Starting Recursive Cluster Feature Elimination with group size {group_size}."
+    )
+
+    while len(current_features) > group_size:
         scores = []
         models = []
+        feature_groups = list(combinations(current_features, group_size))
 
-        for feature in current_features:
-            remaining_features = [f for f in current_features if f != feature]
+        print(f"Evaluating {len(feature_groups)} groups of size {group_size}...")
+
+        # Evaluate removing each group of features
+        for group in feature_groups:
+            remaining_features = [f for f in current_features if f not in group]
 
             if len(remaining_features) == 0:
                 continue
@@ -394,31 +552,55 @@ def recursive_cluster_feature_elimination(
             labels = model.fit_predict(X_train_subset)
 
             if len(set(labels)) > 1:
-                score = silhouette_score(X_train_subset, labels)
+                # Exclude noise for DBSCAN-like algorithms
+                mask = labels != -1
+                if np.sum(mask) > 1:
+                    score = silhouette_score(X_train_subset[mask], labels[mask])
+                else:
+                    score = -1
             else:
                 score = -1
 
             scores.append(score)
-            models.append((remaining_features, X_train_subset, model))
+            models.append((remaining_features, model))
 
         if not scores:
-            continue
+            break  # No valid scores, stop
 
+        # Find the best group removal
         best_idx = np.argmax(scores)
         best_score = scores[best_idx]
+        best_remaining_features, best_model = models[best_idx]
 
+        print(f"Best group removal leads to silhouette score: {best_score:.4f}")
+
+        # Check for improvement
         if best_score > best_silhouette_score:
             best_silhouette_score = best_score
-            optimal_features, X_train_optimal, optimal_model = models[best_idx]
+            optimal_features = best_remaining_features
+            optimal_model = best_model
+            no_improvement_count = 0  # Reset counter
+            print(f"Improved score: {best_silhouette_score:.4f}. Continuing...")
+        else:
+            no_improvement_count += 1
+            print(f"No improvement for {no_improvement_count} iteration(s).")
+
+        # Early stopping condition
+        if no_improvement_count >= patience:
+            print(f"Early stopping after {patience} iterations with no improvement.")
+            break
 
         current_features = optimal_features
 
     return optimal_model, optimal_features, best_silhouette_score
 
 
-def calinski_harabasz_scorer(estimator: ClusterMixin, X: pd.DataFrame) -> float:
+def calinski_harabasz_scorer(
+    estimator: ClusterMixin,
+    X: pd.DataFrame,
+) -> float:
     """
-    Compute the Calinski-Harabasz score for the given estimator's clustering results on the dataset.
+    Computes the Calinski-Harabasz score for the given estimator's clustering results, ensuring there are at least 2 valid clusters.
 
     Parameters:
     ----------
@@ -430,10 +612,18 @@ def calinski_harabasz_scorer(estimator: ClusterMixin, X: pd.DataFrame) -> float:
     Returns:
     -------
     float
-        The Calinski-Harabasz score which reflects the quality of clustering.
+        The Calinski-Harabasz score if valid, or -1 otherwise.
     """
 
     labels = estimator.fit_predict(X)
+    unique_labels = set(labels)
+    unique_labels.discard(-1)  # Exclude noise label (-1) for DBSCAN
+
+    if len(unique_labels) < 2:
+        # Return an invalid score when fewer than 2 clusters are present
+        print(f"Invalid clustering: Only {len(unique_labels)} valid cluster(s) found.")
+        return -1.0
+
     return calinski_harabasz_score(X, labels)
 
 
@@ -444,8 +634,7 @@ def hyperparameter_tuning(
     optimal_features: List[str],
 ) -> ClusterMixin:
     """
-    Perform hyperparameter tuning on the clustering estimator using GridSearchCV,
-    optimizing for the Calinski-Harabasz score.
+    Performs hyperparameter tuning on the clustering estimator using GridSearchCV optimizing for the Calinski-Harabasz score.
 
     Parameters:
     ----------
@@ -479,12 +668,57 @@ def hyperparameter_tuning(
     return tuned_model
 
 
-def train_kmeans_clusterer(
-    X_train: pd.DataFrame, param_grid: Dict[str, List[Any]], features: List[str]
+def bayesian_hyperparameter_tuning(
+    estimator: ClusterMixin,
+    search_spaces: Dict[str, Any],
+    X_train: pd.DataFrame,
+    optimal_features: List[str],
+) -> ClusterMixin:
+    """
+    Performs hyperparameter tuning for a given clustering model using BayesSearchCV optimizing for the Calinski-Harabasz score.
+
+    Parameters
+    ----------
+    estimator : ClusterMixin
+        The clustering model to tune (e.g., KMeans, DBSCAN).
+    search_spaces : Dict[str, Any]
+        A dictionary defining the search space for each hyperparameter.
+    X_train : pd.DataFrame
+        The training dataset containing all features.
+    optimal_features : List[str]
+        The list of optimal feature names for use in model training.
+
+    Returns
+    -------
+    ClusterMixin
+        The best clustering model found by BayesSearchCV after hyperparameter tuning.
+    """
+
+    bayes_search = BayesSearchCV(
+        estimator=estimator,
+        search_spaces=search_spaces,
+        scoring=calinski_harabasz_scorer,
+        cv=NoCV(),
+        refit=True,
+        random_state=42,
+        n_iter=50,
+        n_jobs=6,
+        verbose=1,
+    )
+
+    X_train_optimal = X_train[optimal_features]
+    bayes_search.fit(X_train_optimal)
+    tuned_model = bayes_search.best_estimator_
+    return tuned_model
+
+
+def train_kmeans_clusterer_with_grid_search(
+    X_train: pd.DataFrame,
+    param_grid: Dict[str, List[Any]],
+    features: List[str],
 ) -> Dict[str, Any]:
     """
-    Train a KMeans clustering model, perform recursive feature elimination to find the optimal set
-    of features, and tune the model using grid search for hyperparameter optimization.
+    Trains a KMeans clustering model, perform recursive feature elimination to find the optimal set of features, and tunes the model using grid search for hyperparameter optimization.
 
     Parameters:
     ----------
@@ -498,17 +732,98 @@ def train_kmeans_clusterer(
     Returns:
     -------
     Dict[str, Any]
-        A dictionary containing the tuned KMeans model, optimal features, and best silhouette score.
+        A dictionary containing the tuned KMeans model, optimal features, and the best silhouette score.
     """
 
-    kmeans_model = KMeans(random_state=42)
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
 
-    kmeans_fitted_model, kmeans_optimal_features, kmeans_silhouette_score = (
-        recursive_cluster_feature_elimination(kmeans_model, X_train, features)
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    model_name = (
+        f"KMeans Clusterer Experiment Run - "
+        f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
     )
-    kmeans_tuned_model = hyperparameter_tuning(
-        kmeans_fitted_model, param_grid, X_train, kmeans_optimal_features
-    )
+    registered_model_name = "Credit Card KMeans Clusterer"
+
+    with mlflow.start_run(run_name=model_name) as run:
+        kmeans_model = KMeans(random_state=42)
+
+        (
+            kmeans_fitted_model,
+            kmeans_optimal_features,
+            kmeans_silhouette_score,
+        ) = recursive_cluster_feature_elimination(
+            kmeans_model,
+            X_train,
+            features,
+        )
+
+        kmeans_tuned_model = hyperparameter_tuning(
+            kmeans_fitted_model,
+            param_grid,
+            X_train,
+            kmeans_optimal_features,
+        )
+
+        artifact_path = f"{registered_model_name.lower().replace(" ", "_")}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        try:
+            mlflow.sklearn.log_model(
+                sk_model=kmeans_tuned_model,
+                artifact_path=artifact_path,
+            )
+        except mlflow.exceptions.MlflowException as e:
+            print(f"MLflow error logging model: {e}")
+
+        try:
+            mlflow.log_metrics({"Silhouette Score": kmeans_silhouette_score})
+        except Exception as e:
+            print(f"Error logging metric: {e}")
+
+        model_uri = f"runs:/{run.info.run_id}/{urllib.parse.quote(model_name)}"
+        model_description = (
+            f"KMeans Clusterer for Credit Card Segmentation with "
+            f"optimal feature(s): {kmeans_optimal_features} after RCFE."
+        )
+
+        try:
+            registered_model = mlflow.register_model(
+                model_uri=model_uri,
+                name=registered_model_name,
+            )
+
+            client = mlflow.tracking.MlflowClient()
+            client.update_model_version(
+                name=registered_model_name,
+                version=registered_model.version,
+                description=model_description,
+            )
+
+            client.set_model_version_tag(
+                name=registered_model_name,
+                version=registered_model.version,
+                key="Trained at",
+                value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+
+            client.set_registered_model_alias(
+                name=registered_model_name,
+                version=registered_model.version,
+                alias="Staging",
+            )
+        except MlflowException as e:
+            print(f"Model registration for {model_name} failed: {e}")
+
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as temp_file:
+                pickle.dump(kmeans_optimal_features, temp_file)
+                temp_file_path = temp_file.name
+
+            mlflow.log_artifact(temp_file_path, artifact_path="optimal_features")
+            os.remove(temp_file_path)
+            logger.info("Optimal features logged as artifact to MLflow.")
+        except Exception as e:
+            logger.error(f"Error logging optimal features to MLflow: {e}")
 
     return {
         "Model": kmeans_tuned_model,
@@ -517,12 +832,133 @@ def train_kmeans_clusterer(
     }
 
 
-def train_dbscan_clusterer(
-    X_train: pd.DataFrame, param_grid: Dict[str, List[Any]], features: List[str]
+def train_kmeans_clusterer_with_bayes_search(
+    X_train: pd.DataFrame,
+    search_spaces: Dict[str, Any],
+    features: List[str],
 ) -> Dict[str, Any]:
     """
-    Train a DBSCAN clustering model, perform recursive feature elimination to find the optimal set
-    of features, and tune the model using grid search for hyperparameter optimization.
+    Trains a KMeans clustering model, performs recursive feature elimination to find the optimal set of features, and tunes the model using Bayesian search for hyperparameter optimization.
+
+    Parameters:
+    ----------
+    X_train : pd.DataFrame
+        The training dataset containing all features.
+    search_spaces : Dict[str, Any]
+        A dictionary defining the search space for each hyperparameter.
+    features : List[str]
+        The list of feature names to consider for recursive feature elimination.
+
+    Returns:
+    -------
+    Dict[str, Any]
+        A dictionary containing the tuned KMeans model, optimal features, and the best silhouette score.
+    """
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    model_name = (
+        f"KMeans Clusterer Experiment Run (with Bayesian search) - "
+        f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
+    )
+    registered_model_name = "Credit Card KMeans Clusterer (with Bayesian search)"
+
+    with mlflow.start_run(run_name=model_name) as run:
+        kmeans_model = KMeans(random_state=42)
+
+        (
+            kmeans_fitted_model,
+            kmeans_optimal_features,
+            kmeans_silhouette_score,
+        ) = recursive_cluster_feature_elimination(
+            kmeans_model,
+            X_train,
+            features,
+        )
+
+        kmeans_tuned_model = bayesian_hyperparameter_tuning(
+            kmeans_fitted_model,
+            search_spaces,
+            X_train,
+            kmeans_optimal_features,
+        )
+
+        artifact_path = f"{registered_model_name.lower().replace("(", "").replace(")", "").replace(" ", "_")}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        try:
+            mlflow.sklearn.log_model(
+                sk_model=kmeans_tuned_model,
+                artifact_path=artifact_path,
+            )
+        except mlflow.exceptions.MlflowException as e:
+            print(f"MLflow error logging model: {e}")
+
+        try:
+            mlflow.log_metrics({"Silhouette Score": kmeans_silhouette_score})
+        except Exception as e:
+            print(f"Error logging metric: {e}")
+
+        model_uri = f"runs:/{run.info.run_id}/{urllib.parse.quote(model_name)}"
+        model_description = (
+            f"KMeans Clusterer (with Bayesian search) for Credit Card Segmentation with "
+            f"optimal feature(s): {kmeans_optimal_features} after RCFE."
+        )
+
+        try:
+            registered_model = mlflow.register_model(
+                model_uri=model_uri,
+                name=registered_model_name,
+            )
+
+            client = mlflow.tracking.MlflowClient()
+            client.update_model_version(
+                name=registered_model_name,
+                version=registered_model.version,
+                description=model_description,
+            )
+
+            client.set_model_version_tag(
+                name=registered_model_name,
+                version=registered_model.version,
+                key="Trained at",
+                value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+
+            client.set_registered_model_alias(
+                name=registered_model_name,
+                version=registered_model.version,
+                alias="Staging",
+            )
+        except MlflowException as e:
+            print(f"Model registration for {model_name} failed: {e}")
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as temp_file:
+            pickle.dump(kmeans_optimal_features, temp_file)
+            temp_file_path = temp_file.name
+
+        mlflow.log_artifact(temp_file_path, artifact_path="optimal_features")
+        os.remove(temp_file_path)
+        logger.info("Optimal features logged as artifact to MLflow.")
+    except Exception as e:
+        logger.error(f"Error logging optimal features to MLflow: {e}")
+
+    return {
+        "Model": kmeans_tuned_model,
+        "Optimal Features": kmeans_optimal_features,
+        "Silhouette Score": kmeans_silhouette_score,
+    }
+
+
+def train_dbscan_clusterer_with_grid_search(
+    X_train: pd.DataFrame,
+    param_grid: Dict[str, List[Any]],
+    features: List[str],
+) -> Dict[str, Any]:
+    """
+    Trains a DBSCAN clustering model, performs recursive feature elimination to find the optimal set of features, and tunes the model using grid search for hyperparameter optimization.
 
     Parameters:
     ----------
@@ -536,17 +972,97 @@ def train_dbscan_clusterer(
     Returns:
     -------
     Dict[str, Any]
-        A dictionary containing the tuned DBSCAN model, optimal features, and best silhouette score.
+        A dictionary containing the tuned DBSCAN model, optimal features, and the best silhouette score.
     """
 
-    dbscan_model = DBSCAN()
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
 
-    dbscan_fitted_model, dbscan_optimal_features, dbscan_silhouette_score = (
-        recursive_cluster_feature_elimination(dbscan_model, X_train, features)
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    model_name = (
+        f"DBSCAN Clusterer Experiment Run - "
+        f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
     )
-    dbscan_tuned_model = hyperparameter_tuning(
-        dbscan_fitted_model, param_grid, X_train, dbscan_optimal_features
-    )
+    registered_model_name = "Credit Card DBSCAN Clusterer"
+
+    with mlflow.start_run(run_name=model_name) as run:
+        dbscan_model = DBSCAN()
+
+        (
+            dbscan_fitted_model,
+            dbscan_optimal_features,
+            dbscan_silhouette_score,
+        ) = recursive_cluster_feature_elimination(
+            dbscan_model,
+            X_train,
+            features,
+        )
+
+        dbscan_tuned_model = hyperparameter_tuning(
+            dbscan_fitted_model,
+            param_grid,
+            X_train,
+            dbscan_optimal_features,
+        )
+
+        artifact_path = f"{registered_model_name.lower().replace(" ", "_")}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        try:
+            mlflow.sklearn.log_model(
+                sk_model=dbscan_tuned_model,
+                artifact_path=artifact_path,
+            )
+        except mlflow.exceptions.MlflowException as e:
+            print(f"MLflow error logging model: {e}")
+
+        try:
+            mlflow.log_metrics({"Silhouette Score": dbscan_silhouette_score})
+        except Exception as e:
+            print(f"Error logging metric: {e}")
+
+        model_uri = f"runs:/{run.info.run_id}/{urllib.parse.quote(model_name)}"
+        model_description = (
+            f"DBSCAN Clusterer for Credit Card Segmentation with "
+            f"optimal features: {dbscan_optimal_features} after RCFE."
+        )
+
+        try:
+            registered_model = mlflow.register_model(
+                model_uri=model_uri, name=registered_model_name
+            )
+
+            client = mlflow.tracking.MlflowClient()
+            client.update_model_version(
+                name=registered_model_name,
+                version=registered_model.version,
+                description=model_description,
+            )
+
+            client.set_model_version_tag(
+                name=registered_model_name,
+                version=registered_model.version,
+                key="Trained at",
+                value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+
+            client.set_registered_model_alias(
+                name=registered_model_name,
+                version=registered_model.version,
+                alias="Staging",
+            )
+        except MlflowException as e:
+            print(f"Model registration for {model_name} failed: {e}")
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as temp_file:
+            pickle.dump(dbscan_optimal_features, temp_file)
+            temp_file_path = temp_file.name
+
+        mlflow.log_artifact(temp_file_path, artifact_path="optimal_features")
+        os.remove(temp_file_path)
+        logger.info("Optimal features logged as artifact to MLflow.")
+    except Exception as e:
+        logger.error(f"Error logging optimal features to MLflow: {e}")
 
     return {
         "Model": dbscan_tuned_model,
@@ -555,12 +1071,133 @@ def train_dbscan_clusterer(
     }
 
 
-def train_hierarchical_clusterer(
-    X_train: pd.DataFrame, param_grid: Dict[str, List[Any]], features: List[str]
+def train_dbscan_clusterer_with_bayes_search(
+    X_train: pd.DataFrame,
+    search_spaces: Dict[str, Any],
+    features: List[str],
 ) -> Dict[str, Any]:
     """
-    Train an Agglomerative Hierarchical clustering model, perform recursive feature elimination
-    to find the optimal set of features, and tune the model using grid search for hyperparameter optimization.
+    Trains a DBSCAN clustering model, performs recursive feature elimination to find the optimal set of features, and tunes the model using Bayesian search for hyperparameter optimization.
+
+    Parameters:
+    ----------
+    X_train : pd.DataFrame
+        The training dataset containing all features.
+    search_spaces : Dict[str, Any]
+        A dictionary defining the search space for each hyperparameter.
+    features : List[str]
+        The list of feature names to consider for recursive feature elimination.
+
+    Returns:
+    -------
+    Dict[str, Any]
+        A dictionary containing the tuned DBSCAN model, optimal features, and the best silhouette score.
+    """
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    model_name = (
+        f"DBSCAN Clusterer Experiment Run (with Bayesian search) - "
+        f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
+    )
+    registered_model_name = "Credit Card DBSCAN Clusterer (with Bayesian search)"
+
+    with mlflow.start_run(run_name=model_name) as run:
+        dbscan_model = DBSCAN()
+
+        (
+            dbscan_fitted_model,
+            dbscan_optimal_features,
+            dbscan_silhouette_score,
+        ) = recursive_cluster_feature_elimination(
+            dbscan_model,
+            X_train,
+            features,
+        )
+
+        dbscan_tuned_model = bayesian_hyperparameter_tuning(
+            dbscan_fitted_model,
+            search_spaces,
+            X_train,
+            dbscan_optimal_features,
+        )
+
+        artifact_path = f"{registered_model_name.lower().replace("(", "").replace(")", "").replace(" ", "_")}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        try:
+            mlflow.sklearn.log_model(
+                sk_model=dbscan_tuned_model,
+                artifact_path=artifact_path,
+            )
+        except mlflow.exceptions.MlflowException as e:
+            print(f"MLflow error logging model: {e}")
+
+        try:
+            mlflow.log_metrics({"Silhouette Score": dbscan_silhouette_score})
+        except Exception as e:
+            print(f"Error logging metric: {e}")
+
+        model_uri = f"runs:/{run.info.run_id}/{urllib.parse.quote(model_name)}"
+        model_description = (
+            f"DBSCAN Clusterer (with Bayesian search) for Credit Card Segmentation with "
+            f"optimal features: {dbscan_optimal_features} after RCFE."
+        )
+
+        try:
+            registered_model = mlflow.register_model(
+                model_uri=model_uri,
+                name=registered_model_name,
+            )
+
+            client = mlflow.tracking.MlflowClient()
+            client.update_model_version(
+                name=registered_model_name,
+                version=registered_model.version,
+                description=model_description,
+            )
+
+            client.set_model_version_tag(
+                name=registered_model_name,
+                version=registered_model.version,
+                key="Trained at",
+                value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+
+            client.set_registered_model_alias(
+                name=registered_model_name,
+                version=registered_model.version,
+                alias="Staging",
+            )
+        except MlflowException as e:
+            print(f"Model registration for {model_name} failed: {e}")
+
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as temp_file:
+                pickle.dump(dbscan_optimal_features, temp_file)
+                temp_file_path = temp_file.name
+
+            mlflow.log_artifact(temp_file_path, artifact_path="optimal_features")
+            os.remove(temp_file_path)
+            logger.info("Optimal features logged as artifact to MLflow.")
+        except Exception as e:
+            logger.error(f"Error logging optimal features to MLflow: {e}")
+
+    return {
+        "Model": dbscan_tuned_model,
+        "Optimal Features": dbscan_optimal_features,
+        "Silhouette Score": dbscan_silhouette_score,
+    }
+
+
+def train_hierarchical_clusterer_with_grid_search(
+    X_train: pd.DataFrame,
+    param_grid: Dict[str, List[Any]],
+    features: List[str],
+) -> Dict[str, Any]:
+    """
+    Trains an Agglomerative Hierarchical clustering model, performs recursive feature elimination to find the optimal set of features, and tunes the model using grid search for hyperparameter optimization.
 
     Parameters:
     ----------
@@ -574,29 +1211,254 @@ def train_hierarchical_clusterer(
     Returns:
     -------
     Dict[str, Any]
-        A dictionary containing the tuned Agglomerative Hierarchical model, optimal features,
-        and best silhouette score.
+        A dictionary containing the tuned Agglomerative Hierarchical model, optimal features, and the best silhouette score.
     """
 
-    hierarchical_model = AgglomerativeClustering()
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
 
-    (
-        hierarchical_fitted_model,
-        hierarchical_optimal_features,
-        hierarchical_silhouette_score,
-    ) = recursive_cluster_feature_elimination(hierarchical_model, X_train, features)
-    hierarchical_tuned_model = hyperparameter_tuning(
-        hierarchical_fitted_model,
-        param_grid,
-        X_train,
-        hierarchical_optimal_features,
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    model_name = (
+        f"Agglomerative Hierarchical Clusterer Experiment Run - "
+        f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
     )
+    registered_model_name = "Credit Card Agglomerative Hierarchical Clusterer"
+
+    with mlflow.start_run(run_name=model_name) as run:
+        hierarchical_model = AgglomerativeClustering()
+
+        (
+            hierarchical_fitted_model,
+            hierarchical_optimal_features,
+            hierarchical_silhouette_score,
+        ) = recursive_cluster_feature_elimination(
+            hierarchical_model,
+            X_train,
+            features,
+        )
+
+        hierarchical_tuned_model = hyperparameter_tuning(
+            hierarchical_fitted_model,
+            param_grid,
+            X_train,
+            hierarchical_optimal_features,
+        )
+
+        artifact_path = f"{registered_model_name.lower().replace(" ", "_")}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        try:
+            mlflow.sklearn.log_model(
+                sk_model=hierarchical_tuned_model,
+                artifact_path=artifact_path,
+            )
+        except mlflow.exceptions.MlflowException as e:
+            print(f"MLflow error logging model: {e}")
+
+        try:
+            mlflow.log_metrics({"Silhouette Score": hierarchical_silhouette_score})
+        except Exception as e:
+            print(f"Error logging metric: {e}")
+
+        model_uri = f"runs:/{run.info.run_id}/{urllib.parse.quote(model_name)}"
+        model_description = (
+            f"Agglomerative Hierarchical Clusterer for Credit Card Segmentation with "
+            f"optimal features: {hierarchical_optimal_features} after RCFE."
+        )
+
+        try:
+            registered_model = mlflow.register_model(
+                model_uri=model_uri,
+                name=registered_model_name,
+            )
+
+            client = mlflow.tracking.MlflowClient()
+            client.update_model_version(
+                name=registered_model_name,
+                version=registered_model.version,
+                description=model_description,
+            )
+
+            client.set_model_version_tag(
+                name=registered_model_name,
+                version=registered_model.version,
+                key="Trained at",
+                value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+
+            client.set_registered_model_alias(
+                name=registered_model_name,
+                version=registered_model.version,
+                alias="Staging",
+            )
+        except MlflowException as e:
+            print(f"Model registration for {model_name} failed: {e}")
+
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as temp_file:
+                pickle.dump(hierarchical_optimal_features, temp_file)
+                temp_file_path = temp_file.name
+
+            mlflow.log_artifact(temp_file_path, artifact_path="optimal_features")
+            os.remove(temp_file_path)
+            logger.info("Optimal features logged as artifact to MLflow.")
+        except Exception as e:
+            logger.error(f"Error logging optimal features to MLflow: {e}")
 
     return {
         "Model": hierarchical_tuned_model,
         "Optimal Features": hierarchical_optimal_features,
         "Silhouette Score": hierarchical_silhouette_score,
     }
+
+
+def train_hierarchical_clusterer_with_bayes_search(
+    X_train: pd.DataFrame,
+    search_spaces: Dict[str, Any],
+    features: List[str],
+) -> Dict[str, Any]:
+    """
+    Trains an Agglomerative Hierarchical clustering model, performs recursive feature elimination to find the optimal set of features, and tunes the model using Bayesian search for hyperparameter optimization.
+
+    Parameters:
+    ----------
+    X_train : pd.DataFrame
+        The training dataset containing all features.
+    search_spaces : Dict[str, Any]
+        A dictionary defining the search space for each hyperparameter.
+    features : List[str]
+        The list of feature names to consider for recursive feature elimination.
+
+    Returns:
+    -------
+    Dict[str, Any]
+        A dictionary containing the tuned Agglomerative Hierarchical model, optimal features, and the best silhouette score.
+    """
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    model_name = (
+        f"Agglomerative Hierarchical Clusterer Experiment Run (with Bayesian search) - "
+        f"{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
+    )
+    registered_model_name = (
+        "Credit Card Agglomerative Hierarchical Clusterer (with Bayesian search)"
+    )
+
+    with mlflow.start_run(run_name=model_name) as run:
+        hierarchical_model = AgglomerativeClustering()
+
+        (
+            hierarchical_fitted_model,
+            hierarchical_optimal_features,
+            hierarchical_silhouette_score,
+        ) = recursive_cluster_feature_elimination(hierarchical_model, X_train, features)
+
+        hierarchical_tuned_model = bayesian_hyperparameter_tuning(
+            hierarchical_fitted_model,
+            search_spaces,
+            X_train,
+            hierarchical_optimal_features,
+        )
+
+        artifact_path = f"{registered_model_name.lower().replace("(", "").replace(")", "").replace(" ", "_")}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        try:
+            mlflow.sklearn.log_model(
+                sk_model=hierarchical_tuned_model,
+                artifact_path=artifact_path,
+            )
+        except mlflow.exceptions.MlflowException as e:
+            print(f"MLflow error logging model: {e}")
+
+        try:
+            mlflow.log_metrics({"Silhouette Score": hierarchical_silhouette_score})
+        except Exception as e:
+            print(f"Error logging metric: {e}")
+
+        model_uri = f"runs:/{run.info.run_id}/{urllib.parse.quote(model_name)}"
+        model_description = (
+            f"Agglomerative Hierarchical Clusterer (with Bayesian search) for Credit Card Segmentation with "
+            f"optimal features: {hierarchical_optimal_features} after RCFE."
+        )
+
+        try:
+            registered_model = mlflow.register_model(
+                model_uri=model_uri,
+                name=registered_model_name,
+            )
+
+            client = mlflow.tracking.MlflowClient()
+            client.update_model_version(
+                name=registered_model_name,
+                version=registered_model.version,
+                description=model_description,
+            )
+
+            client.set_model_version_tag(
+                name=registered_model_name,
+                version=registered_model.version,
+                key="Trained at",
+                value=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            )
+
+            client.set_registered_model_alias(
+                name=registered_model_name,
+                version=registered_model.version,
+                alias="Staging",
+            )
+        except MlflowException as e:
+            print(f"Model registration for {model_name} failed: {e}")
+
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pkl") as temp_file:
+                pickle.dump(hierarchical_optimal_features, temp_file)
+                temp_file_path = temp_file.name
+
+            mlflow.log_artifact(temp_file_path, artifact_path="optimal_features")
+            os.remove(temp_file_path)
+            logger.info("Optimal features logged as artifact to MLflow.")
+        except Exception as e:
+            logger.error(f"Error logging optimal features to MLflow: {e}")
+
+    return {
+        "Model": hierarchical_tuned_model,
+        "Optimal Features": hierarchical_optimal_features,
+        "Silhouette Score": hierarchical_silhouette_score,
+    }
+
+
+def load_model_from_mlflow(
+    run_id: str,
+    artifact_path: str,
+) -> Tuple[ClusterMixin, Any]:
+    """
+    Loads a clustering model from MLflow by run_id and artifact_path.
+
+    Parameters:
+    ----------
+    run_id : str
+        The unique identifier for the MLflow run from which to load the model.
+    artifact_path : str
+        The path to the model artifact within the specified MLflow run.
+
+    Returns:
+    -------
+    Tuple[ClusterMixin, Any]
+        The loaded clustering model and the associated optimal features.
+    """
+
+    model_uri = f"runs:/{run_id}/{artifact_path}"
+    model = mlflow.sklearn.load_model(model_uri)
+    optimal_features_path = mlflow.artifacts.download_artifacts(
+        run_id=run_id,
+        artifact_path="optimal_features",
+    )
+    with open(optimal_features_path, "rb") as f:
+        optimal_features = pickle.load(f)
+
+    return model, optimal_features
 
 
 def scatter_plot(
