@@ -1,0 +1,17 @@
+artifact_path: credit_card_dbscan_clusterer_20241216_224522
+flavors:
+  sklearn:
+    code: null
+    pickled_model: model.pkl
+    serialization_format: cloudpickle
+    sklearn_version: 1.5.2
+mlflow_version: 2.19.0
+model_size_bytes: 165591
+model_uuid: 07efa8ebe9894e1ebd173b4115c16a39
+run_id: 0455643cc4164f43bfd7222e50020e57
+saved_input_example_info:
+  artifact_path: input_example.json
+  pandas_orient: split
+  serving_input_path: serving_input_example.json
+  type: dataframe
+utc_time_created: '2024-12-16 21:45:22.606132'

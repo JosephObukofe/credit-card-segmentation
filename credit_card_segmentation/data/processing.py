@@ -14,9 +14,7 @@ from credit_card_segmentation.config.config import (
 )
 
 df = load_data(RAW_DATA)
-
 X_train, X_test = train_test_split(df, test_size=0.2)
-
 X_train.drop(columns="CUST_ID", inplace=True)
 X_test.drop(columns="CUST_ID", inplace=True)
 
