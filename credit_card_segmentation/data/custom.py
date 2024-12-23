@@ -35,7 +35,7 @@ from sklearn.metrics import (
 )
 from credit_card_segmentation.config.config import (
     MLFLOW_TRACKING_URI,
-    MINIO_CONSOLE_ADDRESS,
+    MINIO_URL,
     MINIO_ROOT_USER,
     MINIO_ROOT_PASSWORD,
 )
@@ -295,7 +295,10 @@ def preprocess_training_set(
     )
 
     final_df = pd.concat(
-        [X_dropped.reset_index(drop=True), processed_df.reset_index(drop=True)],
+        [
+            X_dropped.reset_index(drop=True),
+            processed_df.reset_index(drop=True),
+        ],
         axis=1,
     )
 
@@ -362,7 +365,10 @@ def preprocess_test_set(
     )
 
     final_df = pd.concat(
-        [X_dropped.reset_index(drop=True), processed_df.reset_index(drop=True)],
+        [
+            X_dropped.reset_index(drop=True),
+            processed_df.reset_index(drop=True),
+        ],
         axis=1,
     )
 
@@ -393,7 +399,7 @@ def read_csv_from_minio(
     object_name: str,
 ) -> pd.DataFrame:
     """
-    Read a CSV file from MinIO and load it into a pandas DataFrame.
+    Reads a CSV file from MinIO and loads it into a pandas DataFrame.
 
     Parameters
     ----------
@@ -409,35 +415,30 @@ def read_csv_from_minio(
 
     Raises
     -------
-    S3Error
-        If the specified object does not exist in the MinIO bucket or other S3-related error.
     Exception
-        For any other errors that may occur while reading the CSV file.
+        For any errors that may occur while reading the CSV file.
     """
 
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
 
-    s3_client = boto3.client(
-        "s3",
-        endpoint_url=MINIO_CONSOLE_ADDRESS,
-        aws_access_key_id=MINIO_ROOT_USER,
-        aws_secret_access_key=MINIO_ROOT_PASSWORD,
-    )
-
     try:
+        s3_client = boto3.client(
+            "s3",
+            endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ROOT_USER,
+            aws_secret_access_key=MINIO_ROOT_PASSWORD,
+        )
+
         response = s3_client.get_object(Bucket=bucket_name, Key=object_name)
-        df = pd.read_csv(response['Body'])
-        logger.info(f"Successfully loaded CSV data from '{object_name}' in bucket '{bucket_name}'")
+        df = pd.read_csv(io.BytesIO(response["Body"].read()))
+
+        logger.info(
+            f"Successfully loaded CSV data from '{object_name}' in bucket '{bucket_name}'."
+        )
         return df
-    except S3Error as e:
-        logger.error(f"S3 error: The object '{object_name}' does not exist in bucket '{bucket_name}' or another S3-related error occurred: {e}")
-        return None
-    except Minio.S3Error as e:
-        logger.error(f"MinIO error connecting to bucket: {e}")
-        return None
     except Exception as e:
-        logger.error(f"Error reading CSV file: {e}")
+        logger.error(f"Error reading CSV file '{object_name}': {e}")
         return None
 
 
@@ -448,7 +449,7 @@ def upload_data_to_minio(
 ) -> None:
     """
     Uploads a pandas DataFrame to MinIO as a pickled object.
-    
+
     Parameters
     ----------
     dataframe : pd.DataFrame
@@ -457,7 +458,7 @@ def upload_data_to_minio(
         The name of the MinIO bucket where the pickled dataframe will be stored.
     object_name : str
         The name of the pickled dataframe (object) in the MinIO bucket.
-        
+
     Returns
     -------
     None
@@ -466,27 +467,75 @@ def upload_data_to_minio(
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
 
-    s3_client = boto3.client(
-        "s3",
-        endpoint_url=MINIO_CONSOLE_ADDRESS,
-        aws_access_key_id=MINIO_ROOT_USER,
-        aws_secret_access_key=MINIO_ROOT_PASSWORD,
-    )
-
     try:
+        s3_client = boto3.client(
+            "s3",
+            endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ROOT_USER,
+            aws_secret_access_key=MINIO_ROOT_PASSWORD,
+        )
+
         with io.BytesIO() as buffer:
             pickle.dump(dataframe, buffer)
             buffer.seek(0)
-            s3_client.upload_fileobj(buffer, bucket_name, object_name)
-            print(f"Uploaded dataframe to MinIO bucket {bucket_name} as {object_name}")
-    except ClientError as e:
-        logger.error(f"Error uploading dataframe to MinIO: {e}")
+
+            s3_client.upload_fileobj(
+                Fileobj=buffer,
+                Bucket=bucket_name,
+                Key=object_name,
+                ExtraArgs={"ContentType": "application/octet-stream"},
+            )
+
+            logger.info(
+                f"Successfully uploaded DataFrame to MinIO bucket '{bucket_name}' as '{object_name}'"
+            )
     except Exception as e:
-        logger.error(f"An unexpected error occurred: {e}")
+        logger.error(f"An error occurred while uploading data to MinIO: {e}")
 
 
-def load_data_from_minio():
-    pass
+def load_data_from_minio(
+    bucket_name: str,
+    object_name: str,
+) -> pd.DataFrame:
+    """
+    Load a pickled pandas DataFrame from MinIO.
+
+    Parameters
+    ----------
+    bucket_name : str
+        The name of the MinIO bucket where the pickled file is stored.
+    object_name : str
+        The name of the pickled object (file) in the MinIO bucket.
+
+    Returns
+    -------
+    pd.DataFrame
+        A pandas DataFrame deserialized from the pickled file.
+    """
+
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    try:
+        s3_client = boto3.client(
+            "s3",
+            endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ROOT_USER,
+            aws_secret_access_key=MINIO_ROOT_PASSWORD,
+        )
+
+        response = s3_client.get_object(Bucket=bucket_name, Key=object_name)
+
+        with io.BytesIO(response["Body"].read()) as buffer:
+            dataframe = pickle.load(buffer)
+
+        logger.info(
+            f"Successfully loaded pickled DataFrame '{object_name}' from bucket '{bucket_name}'."
+        )
+        return dataframe
+    except Exception as e:
+        logger.error(f"An error occurred while loading data from MinIO: {e}")
+        raise e
 
 
 def recursive_cluster_feature_elimination(
@@ -1457,7 +1506,6 @@ def load_model_from_mlflow(
     )
     with open(optimal_features_path, "rb") as f:
         optimal_features = pickle.load(f)
-
     return model, optimal_features
 
 
