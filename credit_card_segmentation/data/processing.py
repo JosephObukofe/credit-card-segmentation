@@ -4,6 +4,8 @@ import joblib
 from sklearn.model_selection import train_test_split
 from credit_card_segmentation.data.custom import (
     load_data,
+    read_csv_from_minio,
+    upload_data_to_minio,
     preprocess_training_set,
     preprocess_test_set,
 )
@@ -13,7 +15,7 @@ from credit_card_segmentation.config.config import (
     EVALUATION_TEST_DATA,
 )
 
-df = load_data(RAW_DATA)
+df = read_csv_from_minio(bucket_name="raw", object_name="CC_GENERAL.csv")
 X_train, X_test = train_test_split(df, test_size=0.2)
 X_train.drop(columns="CUST_ID", inplace=True)
 X_test.drop(columns="CUST_ID", inplace=True)
@@ -66,3 +68,15 @@ X_test_processed = preprocess_test_set(
 # Saving the preprocessed training and test sets for model training and evaluation
 joblib.dump(X_train_processed, MODEL_TRAINING_DATA + "/X_train_processed.pkl")
 joblib.dump(X_test_processed, EVALUATION_TEST_DATA + "/X_test_processed.pkl")
+
+upload_data_to_minio(
+    dataframe=X_train_processed,
+    bucket_name="processed",
+    object_name="X_train_processed.pkl",
+)
+
+upload_data_to_minio(
+    dataframe=X_test_processed,
+    bucket_name="processed",
+    object_name="X_test_processed.pkl",
+)
