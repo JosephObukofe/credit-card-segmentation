@@ -13,6 +13,7 @@ import mlflow.sklearn
 import mlflow.tracking
 import mlflow.pyfunc
 from mlflow.exceptions import MlflowException
+from mlflow.tracking import MlflowClient
 from botocore.exceptions import BotoCoreError, ClientError
 from minio import Minio
 from minio.error import MinioException, S3Error
@@ -28,6 +29,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import BaseCrossValidator, GridSearchCV
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
 from sklearn.metrics import (
     calinski_harabasz_score,
     silhouette_score,
@@ -825,6 +828,11 @@ def train_kmeans_clusterer_with_grid_search(
             print(f"MLflow error logging model: {e}")
 
         try:
+            mlflow.set_tag("artifact_path", artifact_path)
+        except Exception as e:
+            print(f"Error logging model tag: {e}")
+
+        try:
             mlflow.log_metrics({"Silhouette Score": kmeans_silhouette_score})
         except Exception as e:
             print(f"Error logging metric: {e}")
@@ -943,6 +951,11 @@ def train_kmeans_clusterer_with_bayes_search(
             )
         except mlflow.exceptions.MlflowException as e:
             print(f"MLflow error logging model: {e}")
+
+        try:
+            mlflow.set_tag("artifact_path", artifact_path)
+        except Exception as e:
+            print(f"Error logging model tag: {e}")
 
         try:
             mlflow.log_metrics({"Silhouette Score": kmeans_silhouette_score})
@@ -1065,6 +1078,11 @@ def train_dbscan_clusterer_with_grid_search(
             print(f"MLflow error logging model: {e}")
 
         try:
+            mlflow.set_tag("artifact_path", artifact_path)
+        except Exception as e:
+            print(f"Error logging model tag: {e}")
+
+        try:
             mlflow.log_metrics({"Silhouette Score": dbscan_silhouette_score})
         except Exception as e:
             print(f"Error logging metric: {e}")
@@ -1182,6 +1200,11 @@ def train_dbscan_clusterer_with_bayes_search(
             )
         except mlflow.exceptions.MlflowException as e:
             print(f"MLflow error logging model: {e}")
+
+        try:
+            mlflow.set_tag("artifact_path", artifact_path)
+        except Exception as e:
+            print(f"Error logging model tag: {e}")
 
         try:
             mlflow.log_metrics({"Silhouette Score": dbscan_silhouette_score})
@@ -1304,6 +1327,11 @@ def train_hierarchical_clusterer_with_grid_search(
             print(f"MLflow error logging model: {e}")
 
         try:
+            mlflow.set_tag("artifact_path", artifact_path)
+        except Exception as e:
+            print(f"Error logging model tag: {e}")
+
+        try:
             mlflow.log_metrics({"Silhouette Score": hierarchical_silhouette_score})
         except Exception as e:
             print(f"Error logging metric: {e}")
@@ -1422,6 +1450,11 @@ def train_hierarchical_clusterer_with_bayes_search(
             print(f"MLflow error logging model: {e}")
 
         try:
+            mlflow.set_tag("artifact_path", artifact_path)
+        except Exception as e:
+            print(f"Error logging model tag: {e}")
+
+        try:
             mlflow.log_metrics({"Silhouette Score": hierarchical_silhouette_score})
         except Exception as e:
             print(f"Error logging metric: {e}")
@@ -1479,34 +1512,127 @@ def train_hierarchical_clusterer_with_bayes_search(
 
 
 def load_model_from_mlflow(
+    bucket_name: str,
+    object_name: str,
     run_id: str,
-    artifact_path: str,
+    model_name: str,
+    feature_name: str,
 ) -> Tuple[ClusterMixin, Any]:
     """
-    Loads a clustering model from MLflow by run_id and artifact_path.
+    Loads a model and its corresponding features from MLflow artifacts stored in MinIO.
 
-    Parameters:
+    Parameters
     ----------
+    bucket_name : str
+        The name of the MinIO bucket where the model and features are stored.
+    object_name : str
+        The name of the object to load from the bucket.
     run_id : str
-        The unique identifier for the MLflow run from which to load the model.
-    artifact_path : str
-        The path to the model artifact within the specified MLflow run.
+        The MLflow run ID where the model and features were logged.
+    model_name : str
+        The name of the model to load.
+    feature_name : str
+        The name of the optimal features to load. If None, only the model is loaded.
 
-    Returns:
+    Returns
     -------
     Tuple[ClusterMixin, Any]
-        The loaded clustering model and the associated optimal features.
+        The loaded model and features, or None if an error occurs.
+
+    Notes
+    -----
+    - The model and features are loaded from the specified bucket and object names.
+    - If `feature_name` is None, only the model will be loaded.
     """
 
-    model_uri = f"runs:/{run_id}/{artifact_path}"
-    model = mlflow.sklearn.load_model(model_uri)
-    optimal_features_path = mlflow.artifacts.download_artifacts(
-        run_id=run_id,
-        artifact_path="optimal_features",
-    )
-    with open(optimal_features_path, "rb") as f:
-        optimal_features = pickle.load(f)
-    return model, optimal_features
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    try:
+        s3_client = boto3.client(
+            "s3",
+            endpoint_url=MINIO_URL,
+            aws_access_key_id=MINIO_ROOT_USER,
+            aws_secret_access_key=MINIO_ROOT_PASSWORD,
+        )
+
+        model_object_key = f"1/{run_id}/artifacts/{model_name}/{object_name}"
+        model_response = s3_client.get_object(
+            Bucket=bucket_name,
+            Key=model_object_key,
+        )
+        model_data = model_response["Body"].read()
+        model = pickle.loads(model_data)
+
+        if feature_name:
+            feature_object_key = f"1/{run_id}/artifacts/optimal_features/{feature_name}"
+            feature_response = s3_client.get_object(
+                Bucket=bucket_name,
+                Key=feature_object_key,
+            )
+            feature_data = feature_response["Body"].read()
+            features = pickle.loads(feature_data)
+            logger.info(f"Model and features loaded from MinIO successfully.")
+            return model, features
+        else:
+            logger.info(f"Model loaded from MinIO successfully. No features provided.")
+            return model
+    except Exception as e:
+        logger.error(f"Error loading model and features from MinIO: {e}")
+        return None, None
+
+
+def apply_pca(X_optimal):
+    """
+    Applies Principal Component Analysis (PCA) to reduce the dimensionality of the dataset
+    to 2 components, if the dataset has more than 2 features.
+
+    Parameters
+    ----------
+    X_optimal : np.ndarray or pd.DataFrame
+        The dataset to be transformed. Rows represent samples, and columns represent features.
+
+    Returns
+    -------
+    np.ndarray
+        The transformed dataset with 2 principal components, or the original dataset if it
+        has 2 or fewer features.
+    """
+
+    if X_optimal.shape[1] > 2:
+        pca = PCA(n_components=2)
+        return pca.fit_transform(X_optimal)
+    else:
+        return X_optimal
+
+
+def apply_tsne(X_optimal):
+    """
+    Applies t-Distributed Stochastic Neighbor Embedding (t-SNE) to reduce the dimensionality
+    of the dataset to 2 components, if the dataset has more than 2 features.
+
+    Parameters
+    ----------
+    X_optimal : np.ndarray or pd.DataFrame
+        The dataset to be transformed. Rows represent samples, and columns represent features.
+
+    Returns
+    -------
+    np.ndarray
+        The transformed dataset with 2 components using t-SNE, or the original dataset if it
+        has 2 or fewer features.
+
+    Notes
+    -----
+    - t-SNE is typically used for visualization and may not preserve global structure well.
+    - Random state is set to 42 for reproducibility.
+    """
+
+    if X_optimal.shape[1] > 2:
+        tsne = TSNE(n_components=2, random_state=42)
+        return tsne.fit_transform(X_optimal)
+    else:
+        return X_optimal
 
 
 def scatter_plot(
